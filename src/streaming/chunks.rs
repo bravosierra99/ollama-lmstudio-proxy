@@ -4,11 +4,19 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::constants::ERROR_CANCELLED;
+use std::collections::HashMap;
+
 use crate::handlers::transform::TimingInfo;
+
+struct ToolCallEntry {
+    name: String,
+    arguments: String,
+}
 
 #[derive(Default)]
 pub struct ChunkProcessingState {
     last_finish_reason: Option<String>,
+    tool_call_entries: HashMap<usize, ToolCallEntry>,
 }
 
 impl ChunkProcessingState {
@@ -20,6 +28,55 @@ impl ChunkProcessingState {
         if let Some(reason) = choice.get("finish_reason").and_then(|value| value.as_str()) {
             self.last_finish_reason = Some(reason.to_string());
         }
+    }
+
+    /// Accumulate a streaming tool_calls delta array from OpenAI/LM Studio.
+    /// Each item may carry a partial `arguments` string that must be concatenated
+    /// across chunks before the final result can be converted to Ollama format.
+    pub fn accumulate_tool_calls(&mut self, tool_calls: &[Value]) {
+        for tc in tool_calls {
+            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+            let entry = self.tool_call_entries.entry(index).or_insert_with(|| ToolCallEntry {
+                name: String::new(),
+                arguments: String::new(),
+            });
+            if let Some(func) = tc.get("function") {
+                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                    if !name.is_empty() {
+                        entry.name = name.to_string();
+                    }
+                }
+                if let Some(args_fragment) = func.get("arguments").and_then(|a| a.as_str()) {
+                    entry.arguments.push_str(args_fragment);
+                }
+            }
+        }
+    }
+
+    /// Once the stream is complete, assemble all accumulated tool call fragments
+    /// into Ollama format and return them, clearing internal state.
+    pub fn take_assembled_tool_calls(&mut self) -> Option<Value> {
+        if self.tool_call_entries.is_empty() {
+            return None;
+        }
+        let mut indices: Vec<usize> = self.tool_call_entries.keys().cloned().collect();
+        indices.sort_unstable();
+        let tool_calls: Vec<Value> = indices
+            .iter()
+            .filter_map(|idx| {
+                let entry = self.tool_call_entries.get(idx)?;
+                let arguments: Value = serde_json::from_str(&entry.arguments)
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                Some(json!({
+                    "function": {
+                        "name": entry.name,
+                        "arguments": arguments
+                    }
+                }))
+            })
+            .collect();
+        self.tool_call_entries.clear();
+        if tool_calls.is_empty() { None } else { Some(json!(tool_calls)) }
     }
 }
 
@@ -56,7 +113,10 @@ pub fn process_choice_delta(
         if let Some(new_tool_calls) = delta.get("tool_calls").and_then(|value| value.as_array())
             && !new_tool_calls.is_empty()
         {
-            tool_calls_delta = Some(json!(new_tool_calls));
+            // Accumulate fragments — arguments arrive as partial strings across many
+            // chunks and cannot be parsed as JSON until the stream is complete.
+            // The assembled tool calls are emitted in the final done chunk instead.
+            state.accumulate_tool_calls(new_tool_calls);
         }
     }
 
@@ -264,6 +324,8 @@ pub struct FinalChunkParams<'a> {
     pub chunk_count: u64,
     pub is_chat: bool,
     pub done_reason: Option<&'a str>,
+    /// Assembled tool calls to include in the final chunk (streaming tool call path).
+    pub tool_calls: Option<Value>,
 }
 
 pub fn create_final_chunk(params: FinalChunkParams<'_>) -> Value {
@@ -291,6 +353,12 @@ pub fn create_final_chunk(params: FinalChunkParams<'_>) -> Value {
         chunk_obj.insert("eval_duration".to_string(), json!(timing.eval_duration));
         if !params.is_chat {
             chunk_obj.insert("context".to_string(), json!([]));
+        }
+        // Attach assembled tool calls to the message object in the final chunk
+        if let Some(tc) = params.tool_calls {
+            if let Some(msg) = chunk_obj.get_mut("message").and_then(|m| m.as_object_mut()) {
+                msg.insert("tool_calls".to_string(), tc);
+            }
         }
     }
     chunk

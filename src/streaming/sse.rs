@@ -224,12 +224,14 @@ pub async fn handle_streaming_response(
         };
 
         if stream_result.is_ok() && !token_clone.is_cancelled() {
+            let assembled_tool_calls = chunk_state.take_assembled_tool_calls();
             let final_chunk = create_final_chunk(FinalChunkParams {
                 model_name: &model_clone_for_task,
                 duration: start_time.elapsed(),
                 chunk_count,
                 is_chat: is_chat_endpoint,
                 done_reason: chunk_state.finish_reason(),
+                tool_calls: assembled_tool_calls,
             });
             send_chunk_and_close_channel(&tx, final_chunk).await;
         }
